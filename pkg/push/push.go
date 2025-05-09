@@ -140,11 +140,18 @@ func (imagePush *ImagePush) checkLayerExist(file, image string) (bool, error) {
 		return false, err
 	}
 	req.SetBasicAuth(imagePush.username, imagePush.password)
-	log.Debugf("PUT %s", url)
+	log.Debugf("HEAD %s", url)
 	resp, err := imagePush.httpClient.Do(req)
 	if err != nil {
 		return false, err
 	}
+	defer resp.Body.Close()
+	
+	// 404 means the layer doesn't exist, which is not an error
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("head %s failed, statusCode is %d", url, resp.StatusCode)
 	}
@@ -324,10 +331,18 @@ func (imagePush *ImagePush) chunkUpload(file, url string) error {
 
 func (imagePush *ImagePush) startPushing(image string) (string, error) {
 	url := fmt.Sprintf("%s/v2/%s/blobs/uploads/", imagePush.registryEndpoint, image)
-	resp, err := imagePush.httpClient.Post(url, "", nil)
+	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
 		return "", err
 	}
+	req.SetBasicAuth(imagePush.username, imagePush.password)
+	log.Debugf("POST %s", url)
+	resp, err := imagePush.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	
 	location := resp.Header.Get("Location")
 	if resp.StatusCode == http.StatusAccepted && location != "" {
 		return location, nil
