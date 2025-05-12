@@ -29,3 +29,7 @@ docker-tar-push alpine:latest --registry=http://localhost:5000
 ```sh
 go build -o bin/docker-tar-push cmd/docker-tar-push/main.go
 ```
+
+```shell
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o docker-push.exe
+```

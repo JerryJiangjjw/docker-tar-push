@@ -11,12 +11,14 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"archive/tar"
+
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/schema2"
-	"github.com/mholt/archiver/v3"
 	"github.com/opencontainers/go-digest"
 	"github.com/silenceper/docker-tar-push/pkg/util"
 	"github.com/silenceper/log"
@@ -64,7 +66,9 @@ func (imagePush *ImagePush) Push() {
 		return
 	}
 
-	imagePush.tmpDir = fmt.Sprintf("/tmp/docker-tar-push/%d", time.Now().UnixNano())
+	// 使用系统临时目录
+	tmpBase := os.TempDir()
+	imagePush.tmpDir = filepath.Join(tmpBase, fmt.Sprintf("docker-tar-push-%d", time.Now().UnixNano()))
 	log.Infof("extract archive file %s to %s", imagePush.archivePath, imagePush.tmpDir)
 
 	defer func() {
@@ -74,9 +78,11 @@ func (imagePush *ImagePush) Push() {
 		}
 	}()
 
-	err := archiver.Unarchive(imagePush.archivePath, imagePush.tmpDir)
+	// 使用自定义的 tar 解压函数
+	err := extractTar(imagePush.archivePath, imagePush.tmpDir)
 	if err != nil {
 		log.Errorf("unarchive failed, %+v", err)
+		return
 	}
 	data, err := ioutil.ReadFile(imagePush.tmpDir + "/manifest.json")
 	if err != nil {
@@ -100,7 +106,7 @@ func (imagePush *ImagePush) Push() {
 			//push layer
 			var layerPaths []string
 			for _, layer := range manifestObj.Layers {
-				layerPath := imagePush.tmpDir + "/" + layer
+				layerPath := filepath.Join(imagePush.tmpDir, layer)
 				err = imagePush.pushLayer(layer, image)
 				if err != nil {
 					log.Errorf("pushLayer %s Failed, %v", layer, err)
@@ -213,12 +219,11 @@ func (imagePush *ImagePush) pushManifest(layersPaths []string, imageConfig, imag
 }
 
 func (imagePush *ImagePush) pushConfig(imageConfig, image string) error {
-	configPath := imagePush.tmpDir + "/" + imageConfig
+	configPath := filepath.Join(imagePush.tmpDir, imageConfig)
 	// check image config exists
 	exist, err := imagePush.checkLayerExist(configPath, image)
 	if err != nil {
 		return fmt.Errorf("check layer exist failed,%+v", err)
-
 	}
 	if exist {
 		log.Infof("%s Already exist", imageConfig)
@@ -234,7 +239,7 @@ func (imagePush *ImagePush) pushConfig(imageConfig, image string) error {
 }
 
 func (imagePush *ImagePush) pushLayer(layer, image string) error {
-	layerPath := imagePush.tmpDir + "/" + layer
+	layerPath := filepath.Join(imagePush.tmpDir, layer)
 	// check layer exists
 	exist, err := imagePush.checkLayerExist(layerPath, image)
 	if err != nil {
@@ -358,4 +363,137 @@ func (imagePush *ImagePush) startPushing(image string) (string, error) {
 		return location, nil
 	}
 	return "", fmt.Errorf("post %s status is %d", url, resp.StatusCode)
+}
+
+// extractTar 自定义的 tar 解压函数，处理符号链接
+func extractTar(src, dst string) error {
+	file, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	tr := tar.NewReader(file)
+	// 用于存储符号链接信息
+	symlinks := make(map[string]struct {
+		linkname string
+		header   *tar.Header
+	})
+	// 用于存储已解压的文件路径
+	extractedFiles := make(map[string]string)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		// 统一路径分隔符为 forward slash
+		header.Name = filepath.ToSlash(header.Name)
+		target := filepath.Join(dst, header.Name)
+
+		switch header.Typeflag {
+		case tar.TypeSymlink:
+			// 统一符号链接目标路径的分隔符
+			header.Linkname = filepath.ToSlash(header.Linkname)
+			// 记录符号链接信息
+			symlinks[target] = struct {
+				linkname string
+				header   *tar.Header
+			}{
+				linkname: header.Linkname,
+				header:   header,
+			}
+			log.Debugf("Found symlink: %s -> %s", target, header.Linkname)
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			// 确保目标目录存在
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			// 创建文件
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			// 复制文件内容
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return err
+			}
+			f.Close()
+			// 记录已解压的文件
+			extractedFiles[header.Name] = target
+		}
+	}
+
+	// 处理符号链接
+	for target, symlink := range symlinks {
+		// 尝试在已解压的文件中查找目标文件
+		if targetPath, exists := extractedFiles[symlink.linkname]; exists {
+			// 确保目标目录存在
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			// 复制文件
+			if err := copyFile(targetPath, target); err != nil {
+				log.Errorf("Failed to copy file %s to %s: %v", targetPath, target, err)
+			} else {
+				log.Debugf("Successfully copied %s to %s", targetPath, target)
+			}
+		} else {
+			// 尝试使用相对路径查找
+			relPath := filepath.ToSlash(filepath.Join(filepath.Dir(symlink.header.Name), symlink.linkname))
+			if targetPath, exists := extractedFiles[relPath]; exists {
+				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+					return err
+				}
+				if err := copyFile(targetPath, target); err != nil {
+					log.Errorf("Failed to copy file %s to %s: %v", targetPath, target, err)
+				} else {
+					log.Debugf("Successfully copied %s to %s", targetPath, target)
+				}
+			} else {
+				// 尝试使用绝对路径查找
+				absPath := filepath.ToSlash(filepath.Join(dst, symlink.linkname))
+				if targetPath, exists := extractedFiles[absPath]; exists {
+					if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+						return err
+					}
+					if err := copyFile(targetPath, target); err != nil {
+						log.Errorf("Failed to copy file %s to %s: %v", targetPath, target, err)
+					} else {
+						log.Debugf("Successfully copied %s to %s", targetPath, target)
+					}
+				} else {
+					log.Warnf("Target file %s does not exist for symlink %s", symlink.linkname, target)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// copyFile 复制文件
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	return err
 }
