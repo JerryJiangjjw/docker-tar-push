@@ -32,7 +32,7 @@ type ImagePush struct {
 	httpClient       *http.Client
 }
 
-//NewImagePush new
+// NewImagePush new
 func NewImagePush(archivePath, registryEndpoint, username, password string, skipSSLVerify bool) *ImagePush {
 	registryEndpoint = strings.TrimSuffix(registryEndpoint, "/")
 	tr := &http.Transport{
@@ -49,14 +49,14 @@ func NewImagePush(archivePath, registryEndpoint, username, password string, skip
 	}
 }
 
-//Manifest manifest.json
+// Manifest manifest.json
 type Manifest struct {
 	Config   string   `json:"Config"`
 	RepoTags []string `json:"RepoTags"`
 	Layers   []string `json:"Layers"`
 }
 
-//Push push archive image
+// Push push archive image
 func (imagePush *ImagePush) Push() {
 	//判断tar包是否正常
 	if !util.Exists(imagePush.archivePath) {
@@ -146,12 +146,12 @@ func (imagePush *ImagePush) checkLayerExist(file, image string) (bool, error) {
 		return false, err
 	}
 	defer resp.Body.Close()
-	
+
 	// 404 means the layer doesn't exist, which is not an error
 	if resp.StatusCode == http.StatusNotFound {
 		return false, nil
 	}
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("head %s failed, statusCode is %d", url, resp.StatusCode)
 	}
@@ -320,6 +320,10 @@ func (imagePush *ImagePush) chunkUpload(file, url string) error {
 			}
 			location := resp.Header.Get("Location")
 			if resp.StatusCode == http.StatusAccepted && location != "" {
+				// Handle relative URLs by prepending the registry endpoint if needed
+				if strings.HasPrefix(location, "/") {
+					location = imagePush.registryEndpoint + location
+				}
 				url = location
 			} else {
 				return fmt.Errorf("PATCH chunk file error,code is %d", resp.StatusCode)
@@ -342,9 +346,15 @@ func (imagePush *ImagePush) startPushing(image string) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	
+
 	location := resp.Header.Get("Location")
+	log.Debugf("location: %s", location)
 	if resp.StatusCode == http.StatusAccepted && location != "" {
+		// Handle relative URLs by prepending the registry endpoint if needed
+		if strings.HasPrefix(location, "/") {
+			location = imagePush.registryEndpoint + location
+		}
+		log.Debugf("location: %s", location)
 		return location, nil
 	}
 	return "", fmt.Errorf("post %s status is %d", url, resp.StatusCode)
