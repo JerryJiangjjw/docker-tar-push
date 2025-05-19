@@ -65,7 +65,6 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
 
     steps:
       - name: Download all artifacts
@@ -73,10 +72,18 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create Release
+      - name: Create Release for Tags
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: artifacts/**/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Artifacts Directory for Non-Tag Builds
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        run: |
+          mkdir -p release-artifacts
+          find artifacts -type f -name "*.zip" -o -name "*.tar.gz" | xargs -I{} cp {} release-artifacts/
+          echo "Build artifacts are available in the GitHub Actions run"
